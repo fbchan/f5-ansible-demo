@@ -13,7 +13,7 @@
     os_auth:
       auth_url: http://10.0.31.51:5000/v2.0/
       username: fbchan
-      password: fbchan123
+      password: <password>
       project_name: tenant1
     inst_name: bigip100
 
