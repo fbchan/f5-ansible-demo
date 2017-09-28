@@ -1,0 +1,166 @@
+#!/usr/bin/env ansible-playbook
+---
+
+##################################################
+# Play 1 - Deploy BIGIP VE instance in Openstack
+##################################################
+- name: Deploy F5 BIGIP Virtual Edition instance in OpenStack
+  hosts: localhost
+  connection: local
+  gather_facts: False
+
+  vars:
+    os_auth:
+      auth_url: http://10.0.31.51:5000/v2.0/
+      username: fbchan
+      password: fbchan123
+      project_name: tenant1
+    inst_name: bigip100
+
+  tasks:
+   - name: Spinning up F5 Application Delivery Controller
+     os_server:
+       state: present
+       auth: "{{ os_auth }}"
+       validate_certs: "no"
+       name: "{{ inst_name }}"
+       image: bigip13hf2
+       key_name: fbchan_dell_newton
+       flavor: m1.large
+       auto_floating_ip: no
+       nics:
+        - net-name: mgmt_net
+        - net-name: inside_net
+        - net-name: outside_net
+     register: bigipve
+   - set_fact: inside_ip="{{ bigipve["openstack"]["addresses"]["inside_net"][0]["addr"] }}"
+   - set_fact: outside_ip="{{ bigipve["openstack"]["addresses"]["outside_net"][0]["addr"] }}"
+   - set_fact: mgmt_ip="{{ bigipve["openstack"]["addresses"]["mgmt_net"][0]["addr"] }}"
+   - set_fact: instance_name="{{ inst_name }}"
+   - add_host:
+      name: "{{ mgmt_ip }}"
+      group: deployed-ve
+
+############################################################
+# Play 2 - Wait for BIGIP VE instance to fully boot up
+#############################################################
+- name: waiting for target before continue
+  hosts: deployed-ve
+  environment:
+     F5_SERVER: "{{ inventory_hostname }}"
+     F5_USER: "admin"
+     F5_PASSWORD: "admin"
+     F5_VALIDATE_CERTS: "false"
+     F5_SERVER_PORT: 443
+  gather_facts: False
+  connection: local
+
+  tasks:
+    - name: waiting for {{ inventory_hostname }} https port to be contactable
+      local_action:
+        wait_for host="{{ inventory_hostname }}" port=443 delay=10 timeout=300
+
+    - name: Polling BIGIP to ensure in a READY state
+      uri:
+        url: "https://{{ ansible_host }}//mgmt/tm/sys/db/failover.linksup"
+        status_code: 200
+        timeout: 300
+        user: "admin"
+        password: "admin"
+        validate_certs: no
+        return_content: yes
+      until: bigip_failover_linksup.status == 200 and bigip_failover_linksup.json.value == 'true'
+      retries: 20
+      delay: 10
+      register: bigip_failover_linksup
+
+############################################################
+# Play 3 - Set BIGIP basic configuration prior assign license
+#############################################################
+- name: Setting BIGIP basic configuration
+  hosts: deployed-ve
+  environment:
+      F5_SERVER: "{{ inventory_hostname }}"
+      F5_USER: "admin"
+      F5_PASSWORD: "admin"
+      F5_VALIDATE_CERTS: "false"
+      F5_SERVER_PORT: 443
+  connection: local
+
+  tasks:
+    - name: Configure BIG-IP hostname
+      bigip_command:
+         commands:
+           - tmsh modify sys global-settings hostname "{{ hostvars['localhost']['instance_name'] }}.mgmt.pants.net"
+
+    - name: Configure NTP server
+      bigip_device_ntp:
+        ntp_servers:
+          - "pool.ntp.org"
+
+    - name: Configure timezone
+      bigip_device_ntp:
+        timezone: "Australia/Melbourne"
+
+    - name: Disable BIGIP Setup Utility
+      bigip_command:
+          commands:
+            - tmsh modify sys global-settings gui-setup disabled
+
+############################################################
+# Play 4 - Set BIGIP Networking
+#############################################################
+- name: Configure BIGIP networking
+  hosts: deployed-ve
+  environment:
+      F5_SERVER: "{{ inventory_hostname }}"
+      F5_USER: "admin"
+      F5_PASSWORD: "admin"
+      F5_VALIDATE_CERTS: "false"
+      F5_SERVER_PORT: 443
+  connection: local
+  vars:
+    insideVLAN: "vlan-inside"
+    externalVLAN: "vlan-external"
+    insideSELFIP: "selfip-inside"
+    externalSELFIP: "selfip-external"
+
+  tasks:
+    - name: Configure inside VLAN
+      bigip_vlan:
+         name: "{{ insideVLAN }}"
+         untagged_interface: 1.1
+    - name: Configure external VLAN
+      bigip_vlan:
+         name: "{{ externalVLAN }}"
+         untagged_interface: 1.2
+
+    - name: Configure inside self-ip
+      bigip_selfip:
+         name: "{{ insideSELFIP }}"
+         address: "{{ hostvars['localhost']['inside_ip'] }}"
+         netmask: "255.255.255.0"
+         vlan: "{{ insideVLAN }}"
+
+    - name: Configure external self-ip
+      bigip_selfip:
+         name: "{{ externalSELFIP }}"
+         address: "{{ hostvars['localhost']['outside_ip'] }}"
+         netmask: "255.255.255.0"
+         vlan: "{{ externalVLAN }}"
+
+    - name: Save Configuration
+      bigip_command:
+          commands:
+            - tmsh save sys config
+
+############################################################
+# Play 5 - License BIGIP with BIGIQ license manager
+#############################################################
+- name: License F5 BIG-IP
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  tasks:
+    - name: Attach BIGIQ license key
+      local_action: command /home/foobang/bigiplicmgr.py --bigip_ip "{{ mgmt_ip }}" --action assign-license
